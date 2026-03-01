@@ -49,6 +49,15 @@ export class VideoArtifactStore {
     logger.info("Video artifact store initialized", { dir: this._dir });
   }
 
+  /** Update the video directory at runtime (e.g. after charlotte:configure).
+   *  Clears the in-memory index and reloads from the new location.
+   *  Does not move existing files. */
+  async setDir(dir: string): Promise<void> {
+    this._dir = dir;
+    this.artifacts.clear();
+    await this.initialize();
+  }
+
   async save(artifact: VideoArtifact): Promise<void> {
     this.artifacts.set(artifact.id, artifact);
     await this.saveIndex();

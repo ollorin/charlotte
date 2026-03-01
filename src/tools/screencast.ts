@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import * as os from "node:os";
+import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Page } from "puppeteer";
@@ -11,22 +12,130 @@ import { VideoArtifactStore } from "../state/video-artifact-store.js";
 import type { VideoArtifact } from "../state/video-artifact-store.js";
 
 // ---------------------------------------------------------------------------
-// Module-level recording state
+// Types
 // ---------------------------------------------------------------------------
 
-type ScreenRecorder = Awaited<ReturnType<Page["screencast"]>>;
-
 interface ActiveRecording {
-  recorder: ScreenRecorder;
+  id: string;
+  page: Page;
+  ffmpegProc: ChildProcess;
+  captureTimer: ReturnType<typeof setInterval>;
   outputPath: string;
   format: "webm" | "mp4" | "gif";
   fps: number;
+  framesWritten: number;
   startedAt: Date;
   pageUrl: string;
   pageTitle: string;
+  /** Set to true when stop is called so the capture loop can exit cleanly. */
+  stopping: boolean;
 }
 
-let activeRecording: ActiveRecording | null = null;
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function buildFfmpegArgs(
+  fps: number,
+  format: "webm" | "mp4" | "gif",
+  outputPath: string,
+): string[] {
+  // We pipe raw PNG frames at the configured fps using -framerate.
+  const input = [
+    "-framerate", String(fps),
+    "-f", "image2pipe", "-vcodec", "png", "-i", "pipe:0",
+  ];
+
+  if (format === "mp4") {
+    return [
+      "-loglevel", "error",
+      ...input, "-an",
+      "-vcodec", "libx264", "-preset", "fast", "-crf", "28",
+      "-pix_fmt", "yuv420p",
+      "-movflags", "+faststart",
+      "-f", "mp4", "-y", outputPath,
+    ];
+  }
+  if (format === "gif") {
+    return [
+      "-loglevel", "error",
+      ...input,
+      "-vf", `fps=${fps},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse`,
+      "-f", "gif", "-y", outputPath,
+    ];
+  }
+  // webm / VP9 (default)
+  return [
+    "-loglevel", "error",
+    ...input, "-an",
+    "-b:v", "0", "-vcodec", "vp9", "-crf", "30",
+    "-deadline", "realtime", "-cpu-used", "4",
+    "-f", "webm", "-y", outputPath,
+  ];
+}
+
+async function spawnFfmpeg(bin: string, args: string[]): Promise<ChildProcess> {
+  const proc = spawn(bin, args, { stdio: ["pipe", "ignore", "pipe"] });
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error) => {
+      proc.off("spawn", onSpawn);
+      const code = (err as NodeJS.ErrnoException).code;
+      reject(
+        code === "ENOENT"
+          ? new CharlotteError(
+              CharlotteErrorCode.SESSION_ERROR,
+              `ffmpeg not found: ${bin}`,
+              "Install ffmpeg (e.g. `brew install ffmpeg` or `apt install ffmpeg`) or pass the ffmpegPath option.",
+            )
+          : err,
+      );
+    };
+    const onSpawn = () => {
+      proc.off("error", onError);
+      resolve();
+    };
+    proc.once("error", onError);
+    proc.once("spawn", onSpawn);
+  });
+  // Suppress EPIPE errors if stdin is written after ffmpeg closes
+  proc.stdin?.on("error", () => {});
+  return proc;
+}
+
+/**
+ * Wait for a child process to exit. Returns true if it exited normally,
+ * false if it was killed due to the timeout (file may be corrupt/incomplete).
+ */
+function waitForProcess(proc: ChildProcess, timeoutMs = 30_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      proc.kill();
+      resolve(false);
+    }, timeoutMs);
+    proc.once("close", () => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+}
+
+/**
+ * Capture a single PNG frame from the page and pipe it to ffmpeg.
+ * Intentionally fire-and-forget from the interval — errors are swallowed
+ * so a transient CDP hiccup doesn't crash the recording.
+ */
+async function captureFrame(recording: ActiveRecording): Promise<void> {
+  if (recording.stopping) return;
+  try {
+    const buf = await recording.page.screenshot({ type: "png", encoding: "binary" }) as Buffer;
+    if (!recording.stopping && recording.ffmpegProc.stdin?.writable) {
+      recording.ffmpegProc.stdin.write(buf);
+      recording.framesWritten++;
+    }
+  } catch {
+    // Page may have navigated or closed — skip this frame
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Tool registration
@@ -36,6 +145,10 @@ export function registerScreencastTools(
   server: McpServer,
   deps: ToolDependencies,
 ): void {
+  // Fix #1: closure-scoped so each registerScreencastTools call gets its own
+  // state — prevents cross-instance leaks in tests or multi-server setups.
+  let activeRecording: ActiveRecording | null = null;
+
   // -------------------------------------------------------------------------
   // charlotte:screencast_start
   // -------------------------------------------------------------------------
@@ -43,7 +156,7 @@ export function registerScreencastTools(
     "charlotte:screencast_start",
     {
       description:
-        "Start recording a screencast of the active browser page. Recordings are saved as WebM by default. MP4 and GIF formats require FFmpeg to be installed.",
+        "Start recording a screencast of the active browser page. Uses periodic Page.captureScreenshot + FFmpeg. Requires FFmpeg to be installed.",
       inputSchema: {
         path: z
           .string()
@@ -54,7 +167,7 @@ export function registerScreencastTools(
         format: z
           .enum(["webm", "mp4", "gif"])
           .optional()
-          .describe('Output format. Default "webm". mp4/gif require FFmpeg.'),
+          .describe('Output format. Default "webm". All formats require FFmpeg.'),
         fps: z
           .number()
           .min(1)
@@ -82,54 +195,46 @@ export function registerScreencastTools(
 
         const resolvedFormat = format ?? "webm";
         const resolvedFps = fps ?? 25;
+        const ffmpegBin = ffmpegPath ?? "ffmpeg";
 
-        // Auto-generate output path if not provided
-        let outputPath: string;
-        if (outputPathArg) {
-          outputPath = outputPathArg;
-        } else {
-          const id = VideoArtifactStore.generateId();
-          const dir = deps.config.screenshotDir ?? os.tmpdir();
-          outputPath = path.join(dir, `${id}.${resolvedFormat}`);
-        }
+        // Fix #4: always pre-generate the id so stop() never has to re-derive
+        // it from the path (which breaks for user-supplied paths).
+        const id = VideoArtifactStore.generateId();
+        const outputPath = outputPathArg
+          ?? path.join(deps.videoArtifactStore.dir, `${id}.${resolvedFormat}`);
 
-        // Capture page metadata before recording starts
         const pageUrl = page.url();
         const pageTitle = await page.title();
 
-        // Build screencast options matching the Puppeteer 24 API.
-        // The path cast satisfies Puppeteer's template-literal type requirement.
-        const screencastOptions = {
-          path: outputPath as `${string}.webm` | `${string}.mp4` | `${string}.gif`,
-          format: resolvedFormat,
-          fps: resolvedFps,
-          ...(ffmpegPath ? { ffmpegPath } : {}),
-        };
+        // Spawn ffmpeg before starting capture
+        const ffmpegArgs = buildFfmpegArgs(resolvedFps, resolvedFormat, outputPath);
+        const ffmpegProc = await spawnFfmpeg(ffmpegBin, ffmpegArgs);
 
-        let recorder: ScreenRecorder;
-        try {
-          recorder = await page.screencast(screencastOptions);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          if (/ffmpeg/i.test(msg)) {
-            throw new CharlotteError(
-              CharlotteErrorCode.SESSION_ERROR,
-              `Screencast failed: ffmpeg not found. ${msg}`,
-              "Install ffmpeg (e.g. `brew install ffmpeg` or `apt install ffmpeg`) and ensure it is in your PATH, or pass the ffmpegPath option.",
-            );
-          }
-          throw err;
-        }
-
-        activeRecording = {
-          recorder,
+        const recording: ActiveRecording = {
+          id,
+          page,
+          ffmpegProc,
+          captureTimer: null as unknown as ReturnType<typeof setInterval>,
           outputPath,
           format: resolvedFormat,
           fps: resolvedFps,
+          framesWritten: 0,
           startedAt: new Date(),
           pageUrl,
           pageTitle,
+          stopping: false,
         };
+
+        // Start the capture loop — one screenshot per frame interval
+        const intervalMs = Math.round(1000 / resolvedFps);
+        recording.captureTimer = setInterval(() => {
+          captureFrame(recording);
+        }, intervalMs);
+
+        // Capture the first frame immediately
+        await captureFrame(recording);
+
+        activeRecording = recording;
 
         return {
           content: [
@@ -137,6 +242,7 @@ export function registerScreencastTools(
               type: "text" as const,
               text: JSON.stringify({
                 recording: true,
+                id,
                 outputPath,
                 format: resolvedFormat,
                 fps: resolvedFps,
@@ -171,23 +277,31 @@ export function registerScreencastTools(
           );
         }
 
-        // Capture and clear activeRecording immediately so errors don't leave stale state
+        // Capture and clear immediately so errors don't leave stale state
         const recording = activeRecording;
         activeRecording = null;
 
-        await recording.recorder.stop();
+        // Signal the capture loop to stop, then clear the interval
+        recording.stopping = true;
+        clearInterval(recording.captureTimer);
 
-        // Get file size (default 0 if stat fails — file may still be flushing)
+        // Fix #2: waitForProcess now returns false on timeout so we can
+        // skip saving a potentially corrupt artifact.
+        recording.ffmpegProc.stdin?.end();
+        const ffmpegExited = await waitForProcess(recording.ffmpegProc);
+
         let size = 0;
+        let fileMissing = false;
         try {
           const stat = await fs.stat(recording.outputPath);
           size = stat.size;
         } catch {
-          // File may not exist or may still be flushing — treat as 0
+          fileMissing = true;
         }
 
-        const ext = path.extname(recording.outputPath);
-        const id = path.basename(recording.outputPath, ext);
+        // Fix #4: use the pre-generated id stored on the recording, not
+        // a path-derived one that breaks for user-supplied output paths.
+        const { id } = recording;
         const filename = path.basename(recording.outputPath);
 
         const artifact: VideoArtifact = {
@@ -207,7 +321,6 @@ export function registerScreencastTools(
 
         const durationMs = Date.now() - recording.startedAt.getTime();
         const durationSec = Math.round(durationMs / 1000);
-        const duration_hint = `~${durationSec}s`;
 
         return {
           content: [
@@ -219,7 +332,10 @@ export function registerScreencastTools(
                 format: recording.format,
                 fps: recording.fps,
                 size,
-                duration_hint,
+                frames_written: recording.framesWritten,
+                duration_hint: `~${durationSec}s`,
+                ...(fileMissing && { warning: "Output file not found — ffmpeg may have errored." }),
+                ...(!ffmpegExited && { warning: "ffmpeg encoding timed out and was killed — file may be incomplete." }),
               }),
             },
           ],
@@ -245,6 +361,7 @@ export function registerScreencastTools(
         const screencasts = deps.videoArtifactStore.list();
         const active = activeRecording
           ? {
+              id: activeRecording.id,
               outputPath: activeRecording.outputPath,
               format: activeRecording.format,
               startedAt: activeRecording.startedAt.toISOString(),

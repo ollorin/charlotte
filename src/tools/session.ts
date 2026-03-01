@@ -265,6 +265,9 @@ export function registerSessionTools(
         if (screenshot_dir !== undefined) {
           deps.config.screenshotDir = screenshot_dir;
           await deps.artifactStore.setScreenshotDir(screenshot_dir);
+          await deps.videoArtifactStore.setDir(screenshot_dir);
+          // Note: an active screencast recording continues writing to its
+          // original output path. Only new recordings use the updated dir.
         }
 
         if (dialog_auto_dismiss !== undefined) {
@@ -281,6 +284,7 @@ export function registerSessionTools(
                   snapshot_depth: deps.config.snapshotDepth,
                   auto_snapshot: deps.config.autoSnapshot,
                   screenshot_dir: deps.artifactStore.screenshotDir,
+                  video_dir: deps.videoArtifactStore.dir,
                   dialog_auto_dismiss: deps.config.dialogAutoDismiss,
                 },
               }),

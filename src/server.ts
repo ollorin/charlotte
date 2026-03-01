@@ -15,6 +15,7 @@ import { registerDialogTools } from "./tools/dialog.js";
 import { registerSessionTools } from "./tools/session.js";
 import { registerMonitoringTools } from "./tools/monitoring.js";
 import { registerDevModeTools } from "./tools/dev-mode.js";
+import { registerScreencastTools } from "./tools/screencast.js";
 import type { DevModeState } from "./dev/dev-mode-state.js";
 
 export interface ServerDeps {
@@ -68,6 +69,7 @@ export function createServer(deps: ServerDeps): McpServer {
   registerSessionTools(server, toolDeps);
   registerMonitoringTools(server, toolDeps);
   registerDevModeTools(server, toolDeps);
+  registerScreencastTools(server, toolDeps);
 
   return server;
 }
