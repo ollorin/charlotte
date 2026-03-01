@@ -17,6 +17,18 @@ export interface VideoArtifact {
   timestamp: string; // ISO 8601
 }
 
+/** Fields actually persisted in the JSON index. `path`, `filename`, and
+ *  `mimeType` are omitted because they are fully derivable from `id`,
+ *  `format`, and the store's runtime `_dir`. */
+interface IndexEntry {
+  id: string;
+  format: "webm" | "mp4" | "gif";
+  fps: number;
+  url: string;
+  title: string;
+  timestamp: string;
+}
+
 const INDEX_FILE = ".charlotte-screencasts.json";
 
 export class VideoArtifactStore {
@@ -24,7 +36,7 @@ export class VideoArtifactStore {
   private _dir: string;
 
   constructor(dir?: string) {
-    this._dir = dir ?? path.join(os.tmpdir(), "charlotte-screenshots");
+    this._dir = dir ?? path.join(os.tmpdir(), "charlotte-screencasts");
   }
 
   get dir(): string {
@@ -73,6 +85,9 @@ export class VideoArtifactStore {
     return this.artifacts.size;
   }
 
+  // generateId is static so the screencast tool can pre-generate the artifact
+  // ID — and therefore the output file path — *before* calling
+  // `page.screencast()`, which requires the destination path up front.
   static generateId(): string {
     const now = new Date();
     const datePart = now.toISOString().replace(/[-:T]/g, "").slice(0, 14);
@@ -92,11 +107,22 @@ export class VideoArtifactStore {
   private async loadIndex(): Promise<void> {
     try {
       const raw = await fs.readFile(this.indexPath, "utf-8");
-      const entries: VideoArtifact[] = JSON.parse(raw);
+      const entries: IndexEntry[] = JSON.parse(raw);
       for (const entry of entries) {
+        // Reconstruct derived fields from the store's authoritative _dir so
+        // the index is safe to move/rename without stale absolute paths.
+        const filename = `${entry.id}.${entry.format}`;
+        const filePath = path.join(this._dir, filename);
+        const mimeType = VideoArtifactStore.mimeType(entry.format);
         try {
-          const stat = await fs.stat(entry.path);
-          this.artifacts.set(entry.id, { ...entry, size: stat.size });
+          const stat = await fs.stat(filePath);
+          this.artifacts.set(entry.id, {
+            ...entry,
+            filename,
+            path: filePath,
+            mimeType,
+            size: stat.size,
+          });
         } catch {
           // File missing — skip
         }
@@ -108,7 +134,18 @@ export class VideoArtifactStore {
   }
 
   private async saveIndex(): Promise<void> {
-    const entries = Array.from(this.artifacts.values());
+    // Persist only the minimal IndexEntry fields; derived fields (path,
+    // filename, mimeType) are reconstructed on load.
+    const entries: IndexEntry[] = Array.from(this.artifacts.values()).map(
+      ({ id, format, fps, url, title, timestamp }) => ({
+        id,
+        format,
+        fps,
+        url,
+        title,
+        timestamp,
+      }),
+    );
     await fs.writeFile(this.indexPath, JSON.stringify(entries, null, 2));
   }
 }
