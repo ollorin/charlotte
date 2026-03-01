@@ -20,8 +20,10 @@ async function main(): Promise<void> {
   const config = createDefaultConfig();
 
   // Initialize browser
+  // Use headless 'shell' mode — new headless (true) does not emit
+  // Page.screencastFrame CDP events, which causes page.screencast() to hang.
   const browserManager = new BrowserManager();
-  await browserManager.launch();
+  await browserManager.launch({ headless: "shell" });
 
   // Initialize page management
   const pageManager = new PageManager(config);
