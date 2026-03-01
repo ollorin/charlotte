@@ -1,4 +1,4 @@
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 import { z } from "zod";
@@ -97,20 +97,14 @@ export function registerScreencastTools(
         const pageUrl = page.url();
         const pageTitle = await page.title();
 
-        // Build screencast options matching the Puppeteer 24 API
-        const screencastOptions: {
-          path?: `${string}.${typeof resolvedFormat}`;
-          format?: typeof resolvedFormat;
-          fps?: number;
-          ffmpegPath?: string;
-        } = {
-          path: outputPath as `${string}.${typeof resolvedFormat}`,
+        // Build screencast options matching the Puppeteer 24 API.
+        // The path cast satisfies Puppeteer's template-literal type requirement.
+        const screencastOptions = {
+          path: outputPath as `${string}.webm` | `${string}.mp4` | `${string}.gif`,
           format: resolvedFormat,
           fps: resolvedFps,
+          ...(ffmpegPath ? { ffmpegPath } : {}),
         };
-        if (ffmpegPath) {
-          screencastOptions.ffmpegPath = ffmpegPath;
-        }
 
         let recorder: ScreenRecorder;
         try {
@@ -151,8 +145,8 @@ export function registerScreencastTools(
             },
           ],
         };
-      } catch (err) {
-        return handleToolError(err);
+      } catch (error: unknown) {
+        return handleToolError(error);
       }
     },
   );
@@ -183,10 +177,10 @@ export function registerScreencastTools(
 
         await recording.recorder.stop();
 
-        // Get file size (default 0 if stat fails)
+        // Get file size (default 0 if stat fails — file may still be flushing)
         let size = 0;
         try {
-          const stat = fs.statSync(recording.outputPath);
+          const stat = await fs.stat(recording.outputPath);
           size = stat.size;
         } catch {
           // File may not exist or may still be flushing — treat as 0
@@ -230,8 +224,8 @@ export function registerScreencastTools(
             },
           ],
         };
-      } catch (err) {
-        return handleToolError(err);
+      } catch (error: unknown) {
+        return handleToolError(error);
       }
     },
   );
@@ -270,8 +264,8 @@ export function registerScreencastTools(
             },
           ],
         };
-      } catch (err) {
-        return handleToolError(err);
+      } catch (error: unknown) {
+        return handleToolError(error);
       }
     },
   );
@@ -291,10 +285,12 @@ export function registerScreencastTools(
       try {
         const deleted = await deps.videoArtifactStore.delete(id);
         if (!deleted) {
-          throw new CharlotteError(
-            CharlotteErrorCode.ELEMENT_NOT_FOUND,
-            `Screencast '${id}' not found.`,
-            "Call charlotte:screencasts to see all available screencast IDs.",
+          return handleToolError(
+            new CharlotteError(
+              CharlotteErrorCode.ELEMENT_NOT_FOUND,
+              `Screencast '${id}' not found.`,
+              "Call charlotte:screencasts to see all available screencast IDs.",
+            ),
           );
         }
 
@@ -310,8 +306,8 @@ export function registerScreencastTools(
             },
           ],
         };
-      } catch (err) {
-        return handleToolError(err);
+      } catch (error: unknown) {
+        return handleToolError(error);
       }
     },
   );
