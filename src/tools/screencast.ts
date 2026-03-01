@@ -3,7 +3,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ScreenRecorder } from "puppeteer-core";
+import type { Page } from "puppeteer";
 import { CharlotteError, CharlotteErrorCode } from "../types/errors.js";
 import type { ToolDependencies } from "./tool-helpers.js";
 import { handleToolError } from "./tool-helpers.js";
@@ -13,6 +13,8 @@ import type { VideoArtifact } from "../state/video-artifact-store.js";
 // ---------------------------------------------------------------------------
 // Module-level recording state
 // ---------------------------------------------------------------------------
+
+type ScreenRecorder = Awaited<ReturnType<Page["screencast"]>>;
 
 interface ActiveRecording {
   recorder: ScreenRecorder;
