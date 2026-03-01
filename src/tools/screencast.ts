@@ -4,7 +4,6 @@ import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { Page } from "puppeteer";
 import { CharlotteError, CharlotteErrorCode } from "../types/errors.js";
 import type { ToolDependencies } from "./tool-helpers.js";
 import { handleToolError } from "./tool-helpers.js";
@@ -12,14 +11,26 @@ import { VideoArtifactStore } from "../state/video-artifact-store.js";
 import type { VideoArtifact } from "../state/video-artifact-store.js";
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Maximum recording duration before auto-stop (Issue 3). */
+const MAX_RECORDING_MS = 5 * 60 * 1000;
+
+/** Maximum stderr buffered from ffmpeg (Issue 4). */
+const MAX_STDERR_BYTES = 4096;
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 interface ActiveRecording {
   id: string;
-  page: Page;
   ffmpegProc: ChildProcess;
-  captureTimer: ReturnType<typeof setInterval>;
+  /** Resolves when the self-scheduling capture loop exits (Issue 5). */
+  captureLoopDone: Promise<void>;
+  /** Timer that auto-stops the recording after MAX_RECORDING_MS (Issue 3). */
+  autoStopTimer: ReturnType<typeof setTimeout>;
   outputPath: string;
   format: "webm" | "mp4" | "gif";
   fps: number;
@@ -29,6 +40,8 @@ interface ActiveRecording {
   pageTitle: string;
   /** Set to true when stop is called so the capture loop can exit cleanly. */
   stopping: boolean;
+  /** Collected stderr from ffmpeg, truncated to MAX_STDERR_BYTES (Issue 4). */
+  ffmpegStderr: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -40,10 +53,10 @@ function buildFfmpegArgs(
   format: "webm" | "mp4" | "gif",
   outputPath: string,
 ): string[] {
-  // We pipe raw PNG frames at the configured fps using -framerate.
+  // Issue 6: pipe JPEG frames instead of PNG for smaller frame sizes.
   const input = [
     "-framerate", String(fps),
-    "-f", "image2pipe", "-vcodec", "png", "-i", "pipe:0",
+    "-f", "image2pipe", "-vcodec", "mjpeg", "-i", "pipe:0",
   ];
 
   if (format === "mp4") {
@@ -119,24 +132,6 @@ function waitForProcess(proc: ChildProcess, timeoutMs = 30_000): Promise<boolean
   });
 }
 
-/**
- * Capture a single PNG frame from the page and pipe it to ffmpeg.
- * Intentionally fire-and-forget from the interval — errors are swallowed
- * so a transient CDP hiccup doesn't crash the recording.
- */
-async function captureFrame(recording: ActiveRecording): Promise<void> {
-  if (recording.stopping) return;
-  try {
-    const buf = await recording.page.screenshot({ type: "png", encoding: "binary" }) as Buffer;
-    if (!recording.stopping && recording.ffmpegProc.stdin?.writable) {
-      recording.ffmpegProc.stdin.write(buf);
-      recording.framesWritten++;
-    }
-  } catch {
-    // Page may have navigated or closed — skip this frame
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Tool registration
 // ---------------------------------------------------------------------------
@@ -144,10 +139,134 @@ async function captureFrame(recording: ActiveRecording): Promise<void> {
 export function registerScreencastTools(
   server: McpServer,
   deps: ToolDependencies,
-): void {
-  // Fix #1: closure-scoped so each registerScreencastTools call gets its own
-  // state — prevents cross-instance leaks in tests or multi-server setups.
+): () => Promise<void> {
+  // Closure-scoped so each registerScreencastTools call gets its own
+  // state -- prevents cross-instance leaks in tests or multi-server setups.
   let activeRecording: ActiveRecording | null = null;
+
+  // -----------------------------------------------------------------------
+  // Issue 5 + 9: captureFrame and captureLoop are inner functions so they
+  // can access `deps` to dynamically resolve the active page (Issue 9).
+  // -----------------------------------------------------------------------
+
+  /**
+   * Capture a single JPEG frame from the page and pipe it to ffmpeg.
+   * Errors are swallowed so a transient CDP hiccup doesn't crash the recording.
+   */
+  async function captureFrame(recording: ActiveRecording): Promise<void> {
+    if (recording.stopping) return;
+    try {
+      // Issue 9: always get the current active page instead of a stale ref.
+      const page = deps.pageManager.getActivePage();
+      // Issue 6: use JPEG at quality 80 for smaller frame sizes.
+      const buf = await page.screenshot({ type: "jpeg", quality: 80, encoding: "binary" }) as Buffer;
+      if (!recording.stopping && recording.ffmpegProc.stdin?.writable) {
+        // Issue 15: respect backpressure — if write() returns false, wait
+        // for the pipe buffer to drain before continuing.
+        const ok = recording.ffmpegProc.stdin.write(buf);
+        recording.framesWritten++;
+        if (!ok) {
+          await new Promise<void>(r => recording.ffmpegProc.stdin!.once("drain", r));
+        }
+      }
+    } catch {
+      // Page may have navigated or closed — skip this frame
+    }
+  }
+
+  /**
+   * Issue 5: self-scheduling async loop that replaces setInterval.
+   * Prevents concurrent screenshots from piling up when a frame capture
+   * takes longer than the interval.
+   */
+  async function captureLoop(recording: ActiveRecording): Promise<void> {
+    const intervalMs = Math.round(1000 / recording.fps);
+    while (!recording.stopping) {
+      const frameStart = Date.now();
+      await captureFrame(recording);
+      const elapsed = Date.now() - frameStart;
+      const sleepMs = Math.max(0, intervalMs - elapsed);
+      if (sleepMs > 0 && !recording.stopping) {
+        await new Promise<void>(r => setTimeout(r, sleepMs));
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Issue 3 + 8: shared stopRecording helper used by both the tool handler
+  // and the auto-stop timer / cleanup function.
+  // -----------------------------------------------------------------------
+
+  async function stopRecording(
+    recording: ActiveRecording,
+    videoArtifactStore: VideoArtifactStore,
+  ): Promise<{
+    id: string;
+    outputPath: string;
+    format: string;
+    fps: number;
+    size: number;
+    framesWritten: number;
+    durationSec: number;
+    ffmpegExited: boolean;
+    fileMissing: boolean;
+    ffmpegStderr: string;
+  }> {
+    // Signal the capture loop to stop and wait for it to finish (Issue 5)
+    recording.stopping = true;
+    clearTimeout(recording.autoStopTimer);
+    await recording.captureLoopDone;
+
+    // Close ffmpeg stdin and wait for it to finish encoding
+    recording.ffmpegProc.stdin?.end();
+    const ffmpegExited = await waitForProcess(recording.ffmpegProc);
+
+    let size = 0;
+    let fileMissing = false;
+    try {
+      const stat = await fs.stat(recording.outputPath);
+      size = stat.size;
+    } catch {
+      fileMissing = true;
+    }
+
+    const { id } = recording;
+    const filename = path.basename(recording.outputPath);
+
+    // Issue 11: skip saving zero-frame recordings
+    // Issue 14: skip saving when ffmpeg timed out or file is missing
+    if (recording.framesWritten > 0 && ffmpegExited && !fileMissing) {
+      const artifact: VideoArtifact = {
+        id,
+        filename,
+        path: recording.outputPath,
+        format: recording.format,
+        mimeType: VideoArtifactStore.mimeType(recording.format),
+        size,
+        fps: recording.fps,
+        url: recording.pageUrl,
+        title: recording.pageTitle,
+        timestamp: recording.startedAt.toISOString(),
+      };
+      await videoArtifactStore.save(artifact);
+    }
+
+    const durationMs = Date.now() - recording.startedAt.getTime();
+    const durationSec = Math.round(durationMs / 1000);
+
+    return {
+      id,
+      outputPath: recording.outputPath,
+      format: recording.format,
+      fps: recording.fps,
+      size,
+      framesWritten: recording.framesWritten,
+      durationSec,
+      ffmpegExited,
+      fileMissing,
+      ffmpegStderr: recording.ffmpegStderr,
+    };
+  }
 
   // -------------------------------------------------------------------------
   // charlotte:screencast_start
@@ -162,7 +281,7 @@ export function registerScreencastTools(
           .string()
           .optional()
           .describe(
-            "Output file path. Auto-generated in the screenshot directory if omitted.",
+            "Output file path within the configured video directory. Auto-generated if omitted.",
           ),
         format: z
           .enum(["webm", "mp4", "gif"])
@@ -173,7 +292,7 @@ export function registerScreencastTools(
           .min(1)
           .max(60)
           .optional()
-          .describe("Frames per second (1–60). Default 25."),
+          .describe("Frames per second (1-60). Default 25."),
         ffmpegPath: z
           .string()
           .optional()
@@ -182,12 +301,25 @@ export function registerScreencastTools(
     },
     async ({ path: outputPathArg, format, fps, ffmpegPath }) => {
       try {
+        // Issue 12: include id and start time in the "already recording" error
         if (activeRecording !== null) {
           throw new CharlotteError(
             CharlotteErrorCode.SESSION_ERROR,
-            "A screencast is already in progress. Call charlotte:screencast_stop first.",
+            `A screencast is already in progress (id: ${activeRecording.id}, started ${activeRecording.startedAt.toISOString()}). Call charlotte:screencast_stop first.`,
             "Call charlotte:screencast_stop to finish the current recording before starting a new one.",
           );
+        }
+
+        // Issue 2: validate ffmpegPath basename
+        if (ffmpegPath) {
+          const base = path.basename(ffmpegPath);
+          if (base !== "ffmpeg" && base !== "ffmpeg.exe") {
+            throw new CharlotteError(
+              CharlotteErrorCode.SESSION_ERROR,
+              `Invalid ffmpegPath: basename must be "ffmpeg", got "${base}".`,
+              'The ffmpegPath must point to an ffmpeg binary (e.g. "/usr/local/bin/ffmpeg").',
+            );
+          }
         }
 
         await deps.browserManager.ensureConnected();
@@ -197,11 +329,24 @@ export function registerScreencastTools(
         const resolvedFps = fps ?? 25;
         const ffmpegBin = ffmpegPath ?? "ffmpeg";
 
-        // Fix #4: always pre-generate the id so stop() never has to re-derive
-        // it from the path (which breaks for user-supplied paths).
         const id = VideoArtifactStore.generateId();
-        const outputPath = outputPathArg
-          ?? path.join(deps.videoArtifactStore.dir, `${id}.${resolvedFormat}`);
+        let outputPath: string;
+
+        // Issue 1: validate that user-supplied path is within the store dir
+        if (outputPathArg) {
+          const resolved = path.resolve(outputPathArg);
+          const allowedDir = path.resolve(deps.videoArtifactStore.dir);
+          if (!resolved.startsWith(allowedDir + path.sep) && resolved !== allowedDir) {
+            throw new CharlotteError(
+              CharlotteErrorCode.SESSION_ERROR,
+              `Output path must be within the configured video directory: ${allowedDir}`,
+              "Omit the path parameter to auto-generate a path, or provide a path within the configured screenshot directory.",
+            );
+          }
+          outputPath = resolved;
+        } else {
+          outputPath = path.join(deps.videoArtifactStore.dir, `${id}.${resolvedFormat}`);
+        }
 
         const pageUrl = page.url();
         const pageTitle = await page.title();
@@ -212,9 +357,9 @@ export function registerScreencastTools(
 
         const recording: ActiveRecording = {
           id,
-          page,
           ffmpegProc,
-          captureTimer: null as unknown as ReturnType<typeof setInterval>,
+          captureLoopDone: Promise.resolve(), // replaced below
+          autoStopTimer: null as unknown as ReturnType<typeof setTimeout>, // replaced below
           outputPath,
           format: resolvedFormat,
           fps: resolvedFps,
@@ -223,16 +368,29 @@ export function registerScreencastTools(
           pageUrl,
           pageTitle,
           stopping: false,
+          ffmpegStderr: "",
         };
 
-        // Start the capture loop — one screenshot per frame interval
-        const intervalMs = Math.round(1000 / resolvedFps);
-        recording.captureTimer = setInterval(() => {
-          captureFrame(recording);
-        }, intervalMs);
+        // Issue 4: collect stderr from ffmpeg (capped at MAX_STDERR_BYTES)
+        ffmpegProc.stderr?.on("data", (chunk: Buffer) => {
+          if (recording.ffmpegStderr.length < MAX_STDERR_BYTES) {
+            recording.ffmpegStderr += chunk.toString().slice(
+              0,
+              MAX_STDERR_BYTES - recording.ffmpegStderr.length,
+            );
+          }
+        });
 
-        // Capture the first frame immediately
-        await captureFrame(recording);
+        // Issue 5: start the self-scheduling capture loop
+        recording.captureLoopDone = captureLoop(recording);
+
+        // Issue 3: auto-stop after MAX_RECORDING_MS
+        recording.autoStopTimer = setTimeout(async () => {
+          if (activeRecording === recording && !recording.stopping) {
+            activeRecording = null;
+            await stopRecording(recording, deps.videoArtifactStore);
+          }
+        }, MAX_RECORDING_MS);
 
         activeRecording = recording;
 
@@ -281,61 +439,39 @@ export function registerScreencastTools(
         const recording = activeRecording;
         activeRecording = null;
 
-        // Signal the capture loop to stop, then clear the interval
-        recording.stopping = true;
-        clearInterval(recording.captureTimer);
+        const result = await stopRecording(recording, deps.videoArtifactStore);
 
-        // Fix #2: waitForProcess now returns false on timeout so we can
-        // skip saving a potentially corrupt artifact.
-        recording.ffmpegProc.stdin?.end();
-        const ffmpegExited = await waitForProcess(recording.ffmpegProc);
-
-        let size = 0;
-        let fileMissing = false;
-        try {
-          const stat = await fs.stat(recording.outputPath);
-          size = stat.size;
-        } catch {
-          fileMissing = true;
+        // Issue 11: report zero-frame recordings clearly
+        if (result.framesWritten === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: true,
+                  message: "No frames were captured. The recording was stopped too quickly or the page was not available.",
+                }),
+              },
+            ],
+          };
         }
-
-        // Fix #4: use the pre-generated id stored on the recording, not
-        // a path-derived one that breaks for user-supplied output paths.
-        const { id } = recording;
-        const filename = path.basename(recording.outputPath);
-
-        const artifact: VideoArtifact = {
-          id,
-          filename,
-          path: recording.outputPath,
-          format: recording.format,
-          mimeType: VideoArtifactStore.mimeType(recording.format),
-          size,
-          fps: recording.fps,
-          url: recording.pageUrl,
-          title: recording.pageTitle,
-          timestamp: recording.startedAt.toISOString(),
-        };
-
-        await deps.videoArtifactStore.save(artifact);
-
-        const durationMs = Date.now() - recording.startedAt.getTime();
-        const durationSec = Math.round(durationMs / 1000);
 
         return {
           content: [
             {
               type: "text" as const,
               text: JSON.stringify({
-                id,
-                path: recording.outputPath,
-                format: recording.format,
-                fps: recording.fps,
-                size,
-                frames_written: recording.framesWritten,
-                duration_hint: `~${durationSec}s`,
-                ...(fileMissing && { warning: "Output file not found — ffmpeg may have errored." }),
-                ...(!ffmpegExited && { warning: "ffmpeg encoding timed out and was killed — file may be incomplete." }),
+                id: result.id,
+                path: result.outputPath,
+                format: result.format,
+                fps: result.fps,
+                size: result.size,
+                frames_written: result.framesWritten,
+                duration_hint: `~${result.durationSec}s`,
+                ...(result.fileMissing && { warning: "Output file not found -- ffmpeg may have errored." }),
+                ...(!result.ffmpegExited && { warning: "ffmpeg encoding timed out and was killed -- file may be incomplete." }),
+                // Issue 4: include ffmpeg stderr when non-empty and exit was abnormal
+                ...(result.ffmpegStderr && !result.ffmpegExited && { ffmpeg_stderr: result.ffmpegStderr }),
               }),
             },
           ],
@@ -428,4 +564,13 @@ export function registerScreencastTools(
       }
     },
   );
+
+  // Issue 8: return a cleanup function that stops any active recording
+  return async () => {
+    if (activeRecording) {
+      const recording = activeRecording;
+      activeRecording = null;
+      await stopRecording(recording, deps.videoArtifactStore);
+    }
+  };
 }

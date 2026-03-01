@@ -155,6 +155,10 @@ export class VideoArtifactStore {
         timestamp,
       }),
     );
-    await fs.writeFile(this.indexPath, JSON.stringify(entries, null, 2));
+    // Issue 7: write atomically via temp file + rename to avoid corrupt
+    // index files if the process is interrupted mid-write.
+    const tmpPath = this.indexPath + ".tmp";
+    await fs.writeFile(tmpPath, JSON.stringify(entries, null, 2));
+    await fs.rename(tmpPath, this.indexPath);
   }
 }

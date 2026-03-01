@@ -30,7 +30,13 @@ export interface ServerDeps {
   devModeState?: DevModeState;
 }
 
-export function createServer(deps: ServerDeps): McpServer {
+export interface CreateServerResult {
+  server: McpServer;
+  /** Cleanup function that stops any active screencast recording. */
+  cleanupScreencast: () => Promise<void>;
+}
+
+export function createServer(deps: ServerDeps): CreateServerResult {
   const server = new McpServer(
     {
       name: "charlotte",
@@ -69,7 +75,9 @@ export function createServer(deps: ServerDeps): McpServer {
   registerSessionTools(server, toolDeps);
   registerMonitoringTools(server, toolDeps);
   registerDevModeTools(server, toolDeps);
-  registerScreencastTools(server, toolDeps);
 
-  return server;
+  // Issue 8: capture cleanup function returned by registerScreencastTools
+  const cleanupScreencast = registerScreencastTools(server, toolDeps);
+
+  return { server, cleanupScreencast };
 }

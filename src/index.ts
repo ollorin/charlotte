@@ -20,10 +20,11 @@ async function main(): Promise<void> {
   const config = createDefaultConfig();
 
   // Initialize browser
-  // Use headless 'shell' mode — new headless (true) does not emit
-  // Page.screencastFrame CDP events, which causes page.screencast() to hang.
+  // Issue 13: the screencast implementation now uses page.screenshot()
+  // polling instead of Page.screencastFrame CDP events, so new headless
+  // mode works correctly.
   const browserManager = new BrowserManager();
-  await browserManager.launch({ headless: "shell" });
+  await browserManager.launch({ headless: true });
 
   // Initialize page management
   const pageManager = new PageManager(config);
@@ -52,7 +53,7 @@ async function main(): Promise<void> {
   const devModeState = new DevModeState(config);
 
   // Create and configure MCP server
-  const mcpServer = createServer({
+  const { server: mcpServer, cleanupScreencast } = createServer({
     browserManager,
     pageManager,
     rendererPipeline,
@@ -73,6 +74,8 @@ async function main(): Promise<void> {
   // Graceful shutdown
   const shutdown = async () => {
     logger.info("Shutting down");
+    // Issue 8: stop any active screencast before closing
+    await cleanupScreencast();
     await devModeState.stopAll();
     await mcpServer.close();
     await browserManager.close();
