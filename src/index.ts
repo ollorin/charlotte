@@ -7,6 +7,7 @@ import { RendererPipeline } from "./renderer/renderer-pipeline.js";
 import { ElementIdGenerator } from "./renderer/element-id-generator.js";
 import { SnapshotStore } from "./state/snapshot-store.js";
 import { ArtifactStore } from "./state/artifact-store.js";
+import { VideoArtifactStore } from "./state/video-artifact-store.js";
 import { createDefaultConfig } from "./types/config.js";
 import { createServer } from "./server.js";
 import { DevModeState } from "./dev/dev-mode-state.js";
@@ -41,6 +42,10 @@ async function main(): Promise<void> {
   const artifactStore = new ArtifactStore(config.screenshotDir);
   await artifactStore.initialize();
 
+  // Initialize video screencast artifact store
+  const videoArtifactStore = new VideoArtifactStore(config.screenshotDir);
+  await videoArtifactStore.initialize();
+
   // Initialize dev mode state
   const devModeState = new DevModeState(config);
 
@@ -52,6 +57,7 @@ async function main(): Promise<void> {
     elementIdGenerator,
     snapshotStore,
     artifactStore,
+    videoArtifactStore,
     config,
     devModeState,
   });
