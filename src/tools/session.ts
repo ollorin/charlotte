@@ -241,6 +241,12 @@ export function registerSessionTools(
           .describe(
             "Directory for persistent screenshot artifacts. Changes take effect immediately; existing artifacts remain in the previous directory.",
           ),
+        video_dir: z
+          .string()
+          .optional()
+          .describe(
+            "Directory for persistent screencast recording artifacts. Independent of screenshot_dir. Changes take effect immediately; active recordings continue writing to their original path.",
+          ),
         dialog_auto_dismiss: z
           .enum(["none", "accept_alerts", "accept_all", "dismiss_all"])
           .optional()
@@ -249,9 +255,9 @@ export function registerSessionTools(
           ),
       },
     },
-    async ({ snapshot_depth, auto_snapshot, screenshot_dir, dialog_auto_dismiss }) => {
+    async ({ snapshot_depth, auto_snapshot, screenshot_dir, video_dir, dialog_auto_dismiss }) => {
       try {
-        logger.info("Configuring Charlotte", { snapshot_depth, auto_snapshot, screenshot_dir });
+        logger.info("Configuring Charlotte", { snapshot_depth, auto_snapshot, screenshot_dir, video_dir });
 
         if (snapshot_depth !== undefined) {
           deps.snapshotStore.setDepth(snapshot_depth);
@@ -265,7 +271,12 @@ export function registerSessionTools(
         if (screenshot_dir !== undefined) {
           deps.config.screenshotDir = screenshot_dir;
           await deps.artifactStore.setScreenshotDir(screenshot_dir);
-          await deps.videoArtifactStore.setDir(screenshot_dir);
+          // Note: screenshot_dir no longer implicitly sets video_dir.
+          // Use video_dir parameter to configure the recording directory.
+        }
+
+        if (video_dir !== undefined) {
+          await deps.videoArtifactStore.setDir(video_dir);
           // Note: an active screencast recording continues writing to its
           // original output path. Only new recordings use the updated dir.
         }
