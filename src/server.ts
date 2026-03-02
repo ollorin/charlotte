@@ -5,6 +5,7 @@ import type { RendererPipeline } from "./renderer/renderer-pipeline.js";
 import type { ElementIdGenerator } from "./renderer/element-id-generator.js";
 import type { SnapshotStore } from "./state/snapshot-store.js";
 import type { ArtifactStore } from "./state/artifact-store.js";
+import type { VideoArtifactStore } from "./state/video-artifact-store.js";
 import type { CharlotteConfig } from "./types/config.js";
 import { registerEvaluateTools } from "./tools/evaluate.js";
 import { registerNavigationTools } from "./tools/navigation.js";
@@ -14,6 +15,7 @@ import { registerDialogTools } from "./tools/dialog.js";
 import { registerSessionTools } from "./tools/session.js";
 import { registerMonitoringTools } from "./tools/monitoring.js";
 import { registerDevModeTools } from "./tools/dev-mode.js";
+import { registerScreencastTools } from "./tools/screencast.js";
 import type { DevModeState } from "./dev/dev-mode-state.js";
 
 export interface ServerDeps {
@@ -23,11 +25,18 @@ export interface ServerDeps {
   elementIdGenerator: ElementIdGenerator;
   snapshotStore: SnapshotStore;
   artifactStore: ArtifactStore;
+  videoArtifactStore: VideoArtifactStore;
   config: CharlotteConfig;
   devModeState?: DevModeState;
 }
 
-export function createServer(deps: ServerDeps): McpServer {
+export interface CreateServerResult {
+  server: McpServer;
+  /** Cleanup function that stops any active screencast recording. */
+  cleanupScreencast: () => Promise<void>;
+}
+
+export function createServer(deps: ServerDeps): CreateServerResult {
   const server = new McpServer(
     {
       name: "charlotte",
@@ -54,6 +63,7 @@ export function createServer(deps: ServerDeps): McpServer {
     elementIdGenerator: deps.elementIdGenerator,
     snapshotStore: deps.snapshotStore,
     artifactStore: deps.artifactStore,
+    videoArtifactStore: deps.videoArtifactStore,
     config: deps.config,
     devModeState: deps.devModeState,
   };
@@ -66,5 +76,8 @@ export function createServer(deps: ServerDeps): McpServer {
   registerMonitoringTools(server, toolDeps);
   registerDevModeTools(server, toolDeps);
 
-  return server;
+  // Issue 8: capture cleanup function returned by registerScreencastTools
+  const cleanupScreencast = registerScreencastTools(server, toolDeps);
+
+  return { server, cleanupScreencast };
 }
